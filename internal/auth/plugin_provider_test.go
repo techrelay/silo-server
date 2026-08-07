@@ -15,7 +15,6 @@ func TestRandomPluginOnlyPasswordFitsBcryptLimit(t *testing.T) {
 	if err != nil {
 		t.Fatalf("randomPluginOnlyPassword() error = %v", err)
 	}
-
 	if len(password) > 72 {
 		t.Fatalf("password length = %d, want <= 72", len(password))
 	}
@@ -24,7 +23,7 @@ func TestRandomPluginOnlyPasswordFitsBcryptLimit(t *testing.T) {
 	}
 }
 
-func TestPluginRoleFromResponseRequiresManagedMarker(t *testing.T) {
+func TestPluginRoleFromResponseRequiresManagedMarkerAndContract(t *testing.T) {
 	claims, err := structpb.NewStruct(map[string]any{pluginRoleClaimKey: "ADMIN"})
 	if err != nil {
 		t.Fatal(err)
@@ -38,8 +37,9 @@ func TestPluginRoleFromResponseRequiresManagedMarker(t *testing.T) {
 	}
 
 	claims, err = structpb.NewStruct(map[string]any{
-		pluginRoleManagedClaimKey: true,
-		pluginRoleClaimKey:        "ADMIN",
+		pluginRoleManagedClaimKey:  true,
+		pluginRoleContractClaimKey: pluginRoleContractV1,
+		pluginRoleClaimKey:         "ADMIN",
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -56,8 +56,10 @@ func TestPluginRoleFromResponseRequiresManagedMarker(t *testing.T) {
 func TestPluginRoleFromResponseRejectsMalformedManagedClaims(t *testing.T) {
 	tests := []map[string]any{
 		{pluginRoleManagedClaimKey: "true", pluginRoleClaimKey: "admin"},
-		{pluginRoleManagedClaimKey: true},
-		{pluginRoleManagedClaimKey: true, pluginRoleClaimKey: "owner"},
+		{pluginRoleManagedClaimKey: true, pluginRoleClaimKey: "admin"},
+		{pluginRoleManagedClaimKey: true, pluginRoleContractClaimKey: "silo.auth.managed-role.v2", pluginRoleClaimKey: "admin"},
+		{pluginRoleManagedClaimKey: true, pluginRoleContractClaimKey: pluginRoleContractV1},
+		{pluginRoleManagedClaimKey: true, pluginRoleContractClaimKey: pluginRoleContractV1, pluginRoleClaimKey: "owner"},
 	}
 	for _, values := range tests {
 		claims, err := structpb.NewStruct(values)
