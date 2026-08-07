@@ -9,7 +9,6 @@ import (
 	"fmt"
 	"log/slog"
 	"strings"
-	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -48,7 +47,6 @@ type PluginProvider struct {
 	sessions     *SessionRepository
 	users        *UserRepository
 	identityPool *pgxpool.Pool
-	accounts     *AccountProvisioner
 }
 
 type pluginRoleSnapshot struct {
@@ -69,7 +67,6 @@ func NewPluginProviderWithClientFactory(
 		sessions:     sessions,
 		users:        users,
 		identityPool: pool,
-		accounts:     NewAccountProvisioner(users, nil),
 	}
 }
 
@@ -126,12 +123,7 @@ func (p *PluginProvider) Authenticate(ctx context.Context, creds Credentials) (*
 	if !p.config.AutoProvision {
 		return nil, ErrInvalidCredentials
 	}
-
-	user, err = p.autoProvisionUser(ctx, creds, response)
-	if err != nil {
-		return nil, err
-	}
-	return p.linkProvisionedIdentity(ctx, response, user)
+	return p.autoProvisionAndLinkUser(ctx, creds, response)
 }
 
 func (p *PluginProvider) CompleteOAuth(ctx context.Context, response *pluginv1.AuthenticateResponse) (*models.User, error) {
@@ -152,12 +144,7 @@ func (p *PluginProvider) CompleteOAuth(ctx context.Context, response *pluginv1.A
 	if !p.config.AutoProvision {
 		return nil, ErrInvalidCredentials
 	}
-
-	user, err = p.autoProvisionUser(ctx, Credentials{}, response)
-	if err != nil {
-		return nil, err
-	}
-	return p.linkProvisionedIdentity(ctx, response, user)
+	return p.autoProvisionAndLinkUser(ctx, Credentials{}, response)
 }
 
 func (p *PluginProvider) InstallationID() int { return p.config.InstallationID }
@@ -185,6 +172,9 @@ func (p *PluginProvider) ValidateSession(ctx context.Context, sessionID string) 
 }
 
 func (p *PluginProvider) lookupIdentity(ctx context.Context, externalSubject string) (*models.User, error) {
+	if p.identityPool == nil {
+		return nil, fmt.Errorf("plugin auth identity store unavailable")
+	}
 	var userID int
 	err := p.identityPool.QueryRow(ctx, `
 		SELECT user_id
@@ -202,125 +192,6 @@ func (p *PluginProvider) lookupIdentity(ctx context.Context, externalSubject str
 		return nil, err
 	}
 	return user, nil
-}
-
-func (p *PluginProvider) claimIdentity(ctx context.Context, externalSubject string, userID int) (int, bool, error) {
-	var claimedUserID int
-	err := p.identityPool.QueryRow(ctx, `
-		INSERT INTO plugin_auth_identities (plugin_installation_id, external_subject, user_id)
-		VALUES ($1, $2, $3)
-		ON CONFLICT (plugin_installation_id, external_subject) DO NOTHING
-		RETURNING user_id
-	`, p.config.InstallationID, externalSubject, userID).Scan(&claimedUserID)
-	if err == nil {
-		return claimedUserID, true, nil
-	}
-	if !errors.Is(err, pgx.ErrNoRows) {
-		return 0, false, fmt.Errorf("claim plugin auth identity: %w", err)
-	}
-	err = p.identityPool.QueryRow(ctx, `
-		SELECT user_id
-		FROM plugin_auth_identities
-		WHERE plugin_installation_id = $1 AND external_subject = $2
-	`, p.config.InstallationID, externalSubject).Scan(&claimedUserID)
-	if err != nil {
-		return 0, false, fmt.Errorf("load concurrently claimed plugin auth identity: %w", err)
-	}
-	return claimedUserID, false, nil
-}
-
-func (p *PluginProvider) linkProvisionedIdentity(ctx context.Context, response *pluginv1.AuthenticateResponse, user *models.User) (*models.User, error) {
-	claimedUserID, claimed, err := p.claimIdentity(ctx, response.GetExternalSubject(), user.ID)
-	if err != nil {
-		return nil, p.cleanupProvisionedUser(ctx, user.ID, err)
-	}
-	if claimed && claimedUserID == user.ID {
-		return user, nil
-	}
-	if claimedUserID == user.ID {
-		return user, nil
-	}
-	if err := p.cleanupProvisionedUser(ctx, user.ID, nil); err != nil {
-		return nil, err
-	}
-	existing, err := p.users.GetByID(ctx, claimedUserID)
-	if err != nil {
-		return nil, fmt.Errorf("load concurrently provisioned plugin user: %w", err)
-	}
-	if !existing.Enabled {
-		return nil, ErrUserDisabled
-	}
-	return p.synchronizeClaimedRole(ctx, existing, response)
-}
-
-func (p *PluginProvider) cleanupProvisionedUser(ctx context.Context, userID int, cause error) error {
-	cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
-	defer cancel()
-	if err := p.users.Delete(cleanupCtx, userID); err != nil {
-		if cause != nil {
-			return fmt.Errorf("%w (cleanup provisioned user %d: %v)", cause, userID, err)
-		}
-		return fmt.Errorf("cleanup provisioned user %d: %w", userID, err)
-	}
-	return cause
-}
-
-func (p *PluginProvider) autoProvisionUser(ctx context.Context, creds Credentials, response *pluginv1.AuthenticateResponse) (*models.User, error) {
-	usernameBase := strings.TrimSpace(response.GetDisplayName())
-	if usernameBase == "" {
-		usernameBase = strings.TrimSpace(creds.Username)
-	}
-	if usernameBase == "" {
-		usernameBase = response.GetExternalSubject()
-	}
-	usernameBase = sanitizeUsername(usernameBase)
-	if usernameBase == "" {
-		usernameBase = fmt.Sprintf("plugin_%d", p.config.InstallationID)
-	}
-
-	email := strings.TrimSpace(response.GetEmail())
-	if email == "" {
-		email = fmt.Sprintf("%s@plugin-%d.local", usernameBase, p.config.InstallationID)
-	}
-
-	role := "user"
-	claimedRole, hasClaimedRole, err := pluginRoleFromResponse(response)
-	if err != nil {
-		return nil, err
-	}
-	if hasClaimedRole {
-		role = claimedRole
-	}
-
-	localPasswordLoginEnabled := false
-	password, err := randomPluginOnlyPassword()
-	if err != nil {
-		return nil, fmt.Errorf("generate plugin-only password: %w", err)
-	}
-
-	username := usernameBase
-	for i := 0; i < 10; i++ {
-		user, err := p.accounts.CreateAccount(ctx, CreateAccountInput{
-			User: models.CreateUserInput{
-				Email:                     email,
-				Username:                  username,
-				Password:                  password,
-				LocalPasswordLoginEnabled: &localPasswordLoginEnabled,
-				Role:                      role,
-			},
-		})
-		if err == nil {
-			return user, nil
-		}
-		if !IsDuplicate(err) {
-			return nil, fmt.Errorf("auto-provision plugin user: %w", err)
-		}
-		if existing, lookupErr := p.lookupIdentity(ctx, response.GetExternalSubject()); lookupErr == nil && existing != nil {
-			return existing, nil
-		}
-		username = fmt.Sprintf("%s_%d", usernameBase, i+2)
-	}
-	return nil, fmt.Errorf("auto-provision plugin user: exhausted username attempts")
 }
 
 func (p *PluginProvider) synchronizeClaimedRole(ctx context.Context, user *models.User, response *pluginv1.AuthenticateResponse) (*models.User, error) {
