@@ -7,7 +7,6 @@ import (
 	"strings"
 
 	"github.com/jackc/pgx/v5"
-	"golang.org/x/crypto/bcrypt"
 
 	pluginv1 "github.com/Silo-Server/silo-plugin-sdk/pkg/pluginproto/silo/plugin/v1"
 	"github.com/Silo-Server/silo-server/internal/models"
@@ -44,7 +43,7 @@ func (p *PluginProvider) autoProvisionAndLinkUser(
 	}
 
 	role := "user"
-	claimedRole, hasClaimedRole, err := pluginRoleFromResponse(response)
+	claimedRole, hasClaimedRole, err := p.pluginRoleFromResponse(response)
 	if err != nil {
 		return nil, err
 	}
@@ -56,20 +55,6 @@ func (p *PluginProvider) autoProvisionAndLinkUser(
 	if err != nil {
 		return nil, fmt.Errorf("generate plugin-only password: %w", err)
 	}
-	hash, err := bcrypt.GenerateFromPassword([]byte(password), bcrypt.DefaultCost)
-	if err != nil {
-		return nil, fmt.Errorf("hash plugin-only password: %w", err)
-	}
-
-	permissions := []string(nil)
-	if role != "admin" {
-		permissions = DefaultUserPermissions()
-	}
-	permissions, err = NormalizePermissions(permissions)
-	if err != nil {
-		return nil, err
-	}
-
 	username := usernameBase
 	for attempt := 0; attempt < 10; attempt++ {
 		if existing, lookupErr := p.lookupIdentity(ctx, response.GetExternalSubject()); lookupErr == nil && existing != nil {
@@ -86,12 +71,13 @@ func (p *PluginProvider) autoProvisionAndLinkUser(
 			return nil, fmt.Errorf("begin plugin account provisioning: %w", err)
 		}
 
-		user, createErr := createPluginUserTx(ctx, tx, pluginUserCreateInput{
-			Email:        email,
-			Username:     username,
-			PasswordHash: string(hash),
-			Role:         role,
-			Permissions:  permissions,
+		localPasswordLoginEnabled := false
+		user, createErr := p.users.CreateTx(ctx, tx, models.CreateUserInput{
+			Email:                     email,
+			Username:                  username,
+			Password:                  password,
+			LocalPasswordLoginEnabled: &localPasswordLoginEnabled,
+			Role:                      role,
 		})
 		if createErr != nil {
 			_ = tx.Rollback(ctx)
@@ -140,41 +126,4 @@ func (p *PluginProvider) autoProvisionAndLinkUser(
 	}
 
 	return nil, fmt.Errorf("auto-provision plugin user: exhausted username attempts")
-}
-
-type pluginUserCreateInput struct {
-	Email        string
-	Username     string
-	PasswordHash string
-	Role         string
-	Permissions  []string
-}
-
-func createPluginUserTx(ctx context.Context, tx pgx.Tx, input pluginUserCreateInput) (*models.User, error) {
-	query := `
-		INSERT INTO users (
-			email, username, password_hash, local_password_login_enabled,
-			role, permissions, library_ids, max_playback_quality, access_group_id
-		)
-		VALUES ($1, $2, $3, FALSE, $4, $5, $6, $7,
-			CASE WHEN $4 = 'admin' THEN NULL ELSE (SELECT id FROM access_groups WHERE is_default) END
-		)
-		RETURNING ` + allColumns
-
-	user, err := scanUser(tx.QueryRow(ctx, query,
-		NormalizeEmail(input.Email),
-		NormalizeUsername(input.Username),
-		input.PasswordHash,
-		input.Role,
-		input.Permissions,
-		[]int(nil),
-		"",
-	))
-	if err != nil {
-		if isDuplicateKeyError(err) {
-			return nil, fmt.Errorf("%w: %s", ErrDuplicate, extractConstraint(err))
-		}
-		return nil, err
-	}
-	return user, nil
 }

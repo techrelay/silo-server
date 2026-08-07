@@ -130,6 +130,21 @@ func scanUsers(rows pgx.Rows) ([]*models.User, error) {
 
 // Create inserts a new user with a bcrypt-hashed password and returns the created user.
 func (r *UserRepository) Create(ctx context.Context, input models.CreateUserInput) (*models.User, error) {
+	return r.create(ctx, r.pool, input)
+}
+
+// CreateTx inserts a new user as part of an existing transaction. It uses the
+// same creation path as Create so normalization, defaults, and optional fields
+// cannot drift between transactional and non-transactional callers.
+func (r *UserRepository) CreateTx(ctx context.Context, tx pgx.Tx, input models.CreateUserInput) (*models.User, error) {
+	return r.create(ctx, tx, input)
+}
+
+type userCreateQuerier interface {
+	QueryRow(ctx context.Context, sql string, args ...any) pgx.Row
+}
+
+func (r *UserRepository) create(ctx context.Context, querier userCreateQuerier, input models.CreateUserInput) (*models.User, error) {
 	hash, err := bcrypt.GenerateFromPassword([]byte(input.Password), bcrypt.DefaultCost)
 	if err != nil {
 		return nil, fmt.Errorf("hashing password: %w", err)
@@ -215,7 +230,7 @@ func (r *UserRepository) Create(ctx context.Context, input models.CreateUserInpu
 		allColumns,
 	)
 
-	row := r.pool.QueryRow(ctx, query, args...)
+	row := querier.QueryRow(ctx, query, args...)
 
 	user, err := scanUser(row)
 	if err != nil {

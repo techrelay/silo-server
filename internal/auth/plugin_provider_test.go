@@ -53,11 +53,59 @@ func TestPluginRoleFromResponseRequiresManagedMarkerAndContract(t *testing.T) {
 	}
 }
 
+func TestPluginProviderRequiresCapabilityOptInForManagedRoles(t *testing.T) {
+	claims, err := structpb.NewStruct(map[string]any{
+		pluginRoleManagedClaimKey:  true,
+		pluginRoleContractClaimKey: pluginRoleContractV1,
+		pluginRoleClaimKey:         "admin",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	response := &pluginv1.AuthenticateResponse{Claims: claims}
+
+	withoutCapability := &PluginProvider{}
+	if role, present, err := withoutCapability.pluginRoleFromResponse(response); err != nil || present || role != "" {
+		t.Fatalf("unadvertised role = %q, present = %v, error = %v; want ignored", role, present, err)
+	}
+
+	withCapability := &PluginProvider{config: PluginProviderConfig{ManagedRoles: true}}
+	role, present, err := withCapability.pluginRoleFromResponse(response)
+	if err != nil {
+		t.Fatalf("advertised role error = %v", err)
+	}
+	if !present || role != "admin" {
+		t.Fatalf("advertised role = %q, present = %v; want admin, true", role, present)
+	}
+}
+
+func TestManagedRoleCapabilityEnabledFailsClosed(t *testing.T) {
+	tests := []struct {
+		name     string
+		metadata map[string]any
+		want     bool
+	}{
+		{name: "not advertised", metadata: map[string]any{}},
+		{name: "exact v1", metadata: map[string]any{"managed_role_contract": pluginRoleContractV1}, want: true},
+		{name: "unsupported", metadata: map[string]any{"managed_role_contract": "silo.auth.managed-role.v2"}},
+		{name: "not exact", metadata: map[string]any{"managed_role_contract": " " + pluginRoleContractV1}},
+		{name: "malformed", metadata: map[string]any{"managed_role_contract": true}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := ManagedRoleCapabilityEnabled(test.metadata); got != test.want {
+				t.Fatalf("ManagedRoleCapabilityEnabled() = %v, want %v", got, test.want)
+			}
+		})
+	}
+}
+
 func TestPluginRoleFromResponseRejectsMalformedManagedClaims(t *testing.T) {
 	tests := []map[string]any{
 		{pluginRoleManagedClaimKey: "true", pluginRoleClaimKey: "admin"},
 		{pluginRoleManagedClaimKey: true, pluginRoleClaimKey: "admin"},
 		{pluginRoleManagedClaimKey: true, pluginRoleContractClaimKey: "silo.auth.managed-role.v2", pluginRoleClaimKey: "admin"},
+		{pluginRoleManagedClaimKey: true, pluginRoleContractClaimKey: " " + pluginRoleContractV1, pluginRoleClaimKey: "admin"},
 		{pluginRoleManagedClaimKey: true, pluginRoleContractClaimKey: pluginRoleContractV1},
 		{pluginRoleManagedClaimKey: true, pluginRoleContractClaimKey: pluginRoleContractV1, pluginRoleClaimKey: "owner"},
 	}

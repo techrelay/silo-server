@@ -39,6 +39,7 @@ type PluginProviderConfig struct {
 	CapabilityID   string
 	DisplayName    string
 	AutoProvision  bool
+	ManagedRoles   bool
 }
 
 type PluginProvider struct {
@@ -195,7 +196,7 @@ func (p *PluginProvider) lookupIdentity(ctx context.Context, externalSubject str
 }
 
 func (p *PluginProvider) synchronizeClaimedRole(ctx context.Context, user *models.User, response *pluginv1.AuthenticateResponse) (*models.User, error) {
-	desiredRole, present, err := pluginRoleFromResponse(response)
+	desiredRole, present, err := p.pluginRoleFromResponse(response)
 	if err != nil {
 		return nil, err
 	}
@@ -262,6 +263,13 @@ func (p *PluginProvider) synchronizeClaimedRole(ctx context.Context, user *model
 	return updated, nil
 }
 
+func (p *PluginProvider) pluginRoleFromResponse(response *pluginv1.AuthenticateResponse) (string, bool, error) {
+	if !p.config.ManagedRoles {
+		return "", false, nil
+	}
+	return pluginRoleFromResponse(response)
+}
+
 func pluginRoleFromResponse(response *pluginv1.AuthenticateResponse) (string, bool, error) {
 	if response == nil || response.GetClaims() == nil {
 		return "", false, nil
@@ -287,7 +295,7 @@ func pluginRoleFromResponse(response *pluginv1.AuthenticateResponse) (string, bo
 	if !ok {
 		return "", false, fmt.Errorf("plugin auth claim %q must be a string", pluginRoleContractClaimKey)
 	}
-	if strings.TrimSpace(contract) != pluginRoleContractV1 {
+	if contract != pluginRoleContractV1 {
 		return "", false, fmt.Errorf("plugin auth claim %q contains unsupported contract %q", pluginRoleContractClaimKey, contract)
 	}
 
@@ -304,6 +312,14 @@ func pluginRoleFromResponse(response *pluginv1.AuthenticateResponse) (string, bo
 		return "", false, fmt.Errorf("plugin auth claim %q contains unsupported role %q", pluginRoleClaimKey, text)
 	}
 	return role, true, nil
+}
+
+// ManagedRoleCapabilityEnabled reports whether an installed auth capability
+// explicitly opts into the fixed managed-role v1 response contract. Missing,
+// malformed, and unsupported metadata all disable host role management.
+func ManagedRoleCapabilityEnabled(metadata map[string]any) bool {
+	contract, ok := metadata["managed_role_contract"].(string)
+	return ok && contract == pluginRoleContractV1
 }
 
 func roleSyncUpdateInput(user *models.User, desiredRole string, restorePermissions []string, restoreAccessGroupID *int64) (models.UpdateUserInput, bool) {

@@ -2315,6 +2315,7 @@ func main() {
 			displayName := binding.CapabilityID
 			mode := "credentials"
 			iconURL := ""
+			managedRoles := false
 			capabilities, err := pluginInstallationStore.ListCapabilities(appCtx, binding.InstallationID)
 			if err == nil {
 				for _, capability := range capabilities {
@@ -2344,6 +2345,7 @@ func main() {
 						if url, ok := capability.Metadata["icon_url"].(string); ok {
 							iconURL = url
 						}
+						managedRoles = auth.ManagedRoleCapabilityEnabled(capability.Metadata)
 						break
 					}
 				}
@@ -2383,6 +2385,7 @@ func main() {
 						CapabilityID:   binding.CapabilityID,
 						DisplayName:    displayName,
 						AutoProvision:  binding.AutoProvision,
+						ManagedRoles:   managedRoles,
 					},
 					sessionRepo,
 					userRepo,
