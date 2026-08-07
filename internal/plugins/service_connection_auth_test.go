@@ -9,7 +9,11 @@ import (
 )
 
 func TestPluginConnectionCheckCapabilityUsesAdvertisedAuthProvider(t *testing.T) {
-	metadata, err := structpb.NewStruct(map[string]any{"connection_test": true})
+	metadata, err := structpb.NewStruct(map[string]any{
+		connectionTestEnabledMetadataKey:    true,
+		connectionTestConfigKeysMetadataKey: []string{"ldap"},
+		connectionTestAckClaimMetadataKey:   "silo_connection_test_ok",
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -21,12 +25,15 @@ func TestPluginConnectionCheckCapabilityUsesAdvertisedAuthProvider(t *testing.T)
 		},
 	}}
 
-	capability, err := pluginConnectionCheckCapabilityForManifest(manifest)
+	capability, err := pluginConnectionCheckCapabilityForManifest(manifest, "ldap")
 	if err != nil {
 		t.Fatalf("pluginConnectionCheckCapabilityForManifest returned an error: %v", err)
 	}
 	if capability.kind != connectionCheckKindAuth || capability.id != "ldap" {
 		t.Fatalf("capability = %#v, want auth provider ldap", capability)
+	}
+	if capability.ackClaim != "silo_connection_test_ok" {
+		t.Fatalf("ack claim = %q", capability.ackClaim)
 	}
 }
 
@@ -38,14 +45,14 @@ func TestPluginConnectionCheckCapabilityRejectsUnadvertisedAuthProvider(t *testi
 		},
 	}}
 
-	_, err := pluginConnectionCheckCapabilityForManifest(manifest)
+	_, err := pluginConnectionCheckCapabilityForManifest(manifest, "auth")
 	if !errors.Is(err, ErrConnectionTestUnsupported) {
 		t.Fatalf("error = %v, want ErrConnectionTestUnsupported", err)
 	}
 }
 
 func TestPluginConnectionCheckCapabilityRejectsDisabledAuthProbe(t *testing.T) {
-	metadata, err := structpb.NewStruct(map[string]any{"connection_test": false})
+	metadata, err := structpb.NewStruct(map[string]any{connectionTestEnabledMetadataKey: false})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -57,14 +64,23 @@ func TestPluginConnectionCheckCapabilityRejectsDisabledAuthProbe(t *testing.T) {
 		},
 	}}
 
-	_, err = pluginConnectionCheckCapabilityForManifest(manifest)
+	_, err = pluginConnectionCheckCapabilityForManifest(manifest, "auth")
 	if !errors.Is(err, ErrConnectionTestUnsupported) {
 		t.Fatalf("error = %v, want ErrConnectionTestUnsupported", err)
 	}
 }
 
-func TestPluginConnectionCheckCapabilityPreservesMetadataProviderPriority(t *testing.T) {
-	authMetadata, err := structpb.NewStruct(map[string]any{"connection_test": true})
+func TestPluginConnectionCheckCapabilityTargetsConfigKey(t *testing.T) {
+	authMetadata, err := structpb.NewStruct(map[string]any{
+		connectionTestEnabledMetadataKey:    true,
+		connectionTestConfigKeysMetadataKey: []string{"ldap"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	metadataMetadata, err := structpb.NewStruct(map[string]any{
+		connectionTestConfigKeysMetadataKey: []string{"metadata"},
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -75,16 +91,53 @@ func TestPluginConnectionCheckCapabilityPreservesMetadataProviderPriority(t *tes
 			Metadata: authMetadata,
 		},
 		{
-			Type: "metadata_provider.v1",
-			Id:   "metadata",
+			Type:     "metadata_provider.v1",
+			Id:       "metadata",
+			Metadata: metadataMetadata,
 		},
 	}}
 
-	capability, err := pluginConnectionCheckCapabilityForManifest(manifest)
+	capability, err := pluginConnectionCheckCapabilityForManifest(manifest, "ldap")
 	if err != nil {
 		t.Fatalf("pluginConnectionCheckCapabilityForManifest returned an error: %v", err)
 	}
+	if capability.kind != connectionCheckKindAuth || capability.id != "ldap" {
+		t.Fatalf("capability = %#v, want auth provider ldap", capability)
+	}
+
+	capability, err = pluginConnectionCheckCapabilityForManifest(manifest, "metadata")
+	if err != nil {
+		t.Fatalf("metadata selection returned an error: %v", err)
+	}
 	if capability.kind != connectionCheckKindMetadata || capability.id != "metadata" {
 		t.Fatalf("capability = %#v, want metadata provider", capability)
+	}
+}
+
+func TestPluginConnectionCheckCapabilityRejectsAmbiguousUnmappedCapabilities(t *testing.T) {
+	authMetadata, err := structpb.NewStruct(map[string]any{connectionTestEnabledMetadataKey: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifest := &pluginv1.PluginManifest{Capabilities: []*pluginv1.CapabilityDescriptor{
+		{Type: "auth_provider.v1", Id: "auth", Metadata: authMetadata},
+		{Type: "metadata_provider.v1", Id: "metadata"},
+	}}
+	_, err = pluginConnectionCheckCapabilityForManifest(manifest, "ldap")
+	if !errors.Is(err, ErrConnectionTestUnsupported) {
+		t.Fatalf("error = %v, want ambiguity to be unsupported", err)
+	}
+}
+
+func TestMetadataProviderConnectionProbeTypeRejectsAllDisabled(t *testing.T) {
+	metadata, err := structpb.NewStruct(map[string]any{
+		"default_priority": map[string]any{"movie": 0, "series": 0},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	capability := &pluginv1.CapabilityDescriptor{Type: "metadata_provider.v1", Id: "metadata", Metadata: metadata}
+	if probeType, ok := metadataProviderConnectionProbeType(capability); ok || probeType != "" {
+		t.Fatalf("probe type = %q, ok = %v; want disabled", probeType, ok)
 	}
 }
