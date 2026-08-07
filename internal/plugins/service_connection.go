@@ -91,10 +91,13 @@ func runMetadataProviderConnectionCheck(
 	capability := metadataProviderConnectionCheckCapability(manifest, capabilityID)
 	probeType, ok := metadataProviderConnectionProbeType(capability)
 	if !ok {
-		return &ConnectionTestError{
-			Message: "The metadata provider does not advertise any enabled content type that can be probed.",
-			Cause:   ErrConnectionTestUnsupported,
-		}
+		slog.DebugContext(ctx,
+			"skipping metadata provider connection check for unsupported probe type", "component", "plugins",
+			"plugin_id", manifest.GetPluginId(),
+			"capability_id", capabilityID,
+			"item_type", "movie",
+		)
+		return nil
 	}
 
 	metadataClient, err := client.MetadataProvider(capabilityID)
@@ -477,24 +480,10 @@ func metadataProviderConnectionProbeType(capability *pluginv1.CapabilityDescript
 	if !ok {
 		return "movie", true
 	}
-	keys := make([]string, 0, len(priorities))
-	for key, priority := range priorities {
-		if priority > 0 {
-			keys = append(keys, key)
-		}
-	}
-	if len(keys) == 0 {
+	if priorities["movie"] <= 0 {
 		return "", false
 	}
-	sort.Strings(keys)
-	for _, preferred := range []string{"movie", "series", "show", "book"} {
-		for _, key := range keys {
-			if key == preferred {
-				return key, true
-			}
-		}
-	}
-	return keys[0], true
+	return "movie", true
 }
 
 func metadataProviderDefaultPriorities(

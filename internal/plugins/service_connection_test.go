@@ -553,6 +553,7 @@ func TestServiceTestGlobalConfigUsesMergedDraftAndStopsTemporaryInstance(t *test
 		_ context.Context,
 		client pluginClient,
 		manifest *pluginv1.PluginManifest,
+		configKey string,
 	) error {
 		probeCalls++
 		if client == nil {
@@ -560,6 +561,9 @@ func TestServiceTestGlobalConfigUsesMergedDraftAndStopsTemporaryInstance(t *test
 		}
 		if manifest.GetPluginId() != "silo.metadb" {
 			t.Fatalf("manifest plugin id = %q, want silo.metadb", manifest.GetPluginId())
+		}
+		if configKey != "connection" {
+			t.Fatalf("config key = %q, want connection", configKey)
 		}
 		return nil
 	}
@@ -676,7 +680,7 @@ func TestRunPluginConnectionCheckSkipsMovieProbeForAudiobookOnlyProvider(t *test
 	}
 	client := &fakePluginClient{manifest: manifest}
 
-	if err := runPluginConnectionCheck(context.Background(), client, manifest); err != nil {
+	if err := runPluginConnectionCheck(context.Background(), client, manifest, ""); err != nil {
 		t.Fatalf("runPluginConnectionCheck() error = %v", err)
 	}
 	if client.metadataProviderCalls != 0 {
@@ -738,6 +742,7 @@ func TestServiceTestGlobalConfigStopsTemporaryInstanceOnProbeFailure(t *testing.
 		_ context.Context,
 		_ pluginClient,
 		_ *pluginv1.PluginManifest,
+		_ string,
 	) error {
 		return &ConnectionTestError{Message: "probe failed"}
 	}
@@ -785,6 +790,7 @@ func TestServiceTestGlobalConfigUsesUniqueTemporaryInstallationIDs(t *testing.T)
 		_ context.Context,
 		_ pluginClient,
 		_ *pluginv1.PluginManifest,
+		_ string,
 	) error {
 		return nil
 	}
