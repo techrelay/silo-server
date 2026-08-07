@@ -379,8 +379,6 @@ func pluginConnectionCheckCapabilityForManifest(
 		}
 	}
 	if len(candidates) == 1 && candidates[0].kind == connectionCheckKindMetadata {
-		// Preserve the pre-extension metadata-provider behavior where a plugin
-		// exposes one unambiguous metadata connection test but predates config-key mapping.
 		return candidates[0], nil
 	}
 	return pluginConnectionCheckCapability{}, &ConnectionTestError{
@@ -410,16 +408,12 @@ func pluginConnectionCheckCapabilities(manifest *pluginv1.PluginManifest) []plug
 			}
 			ackClaim, _ := metadata[connectionTestAckClaimMetadataKey].(string)
 			contract, _ := metadata[connectionTestContractMetadataKey].(string)
-			configKeys := capabilityConnectionTestConfigKeys(capability)
-			if strings.TrimSpace(contract) != connectionTestContractV1 || strings.TrimSpace(ackClaim) == "" || len(configKeys) == 0 {
-				continue
-			}
 			result = append(result, pluginConnectionCheckCapability{
 				kind:       connectionCheckKindAuth,
 				id:         capability.GetId(),
-				configKeys: configKeys,
+				configKeys: capabilityConnectionTestConfigKeys(capability),
 				ackClaim:   strings.TrimSpace(ackClaim),
-				contract:   connectionTestContractV1,
+				contract:   strings.TrimSpace(contract),
 			})
 		}
 	}
