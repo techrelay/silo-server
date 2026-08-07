@@ -18,11 +18,12 @@ import (
 var ErrConnectionTestUnsupported = errors.New("plugin connection test unsupported")
 
 const (
-	connectionTestEnabledMetadataKey          = "connection_test"
-	connectionTestContractMetadataKey         = "connection_test_contract"
-	connectionTestConfigKeysMetadataKey       = "connection_test_config_keys"
-	connectionTestAckClaimMetadataKey         = "connection_test_ack_claim"
-	connectionTestResponseContractClaimKey    = "silo_connection_test_contract"
+	connectionTestEnabledMetadataKey       = "connection_test"
+	connectionTestContractMetadataKey      = "connection_test_contract"
+	connectionTestConfigKeysMetadataKey    = "connection_test_config_keys"
+	connectionTestAckClaimMetadataKey      = "connection_test_ack_claim"
+	connectionTestResponseContractClaimKey = "silo_connection_test_contract"
+	connectionTestContractV1               = "silo.auth.connection-test.v1"
 )
 
 type ConnectionTestError struct {
@@ -129,6 +130,13 @@ func runAuthProviderConnectionCheck(
 	ackClaim string,
 	contract string,
 ) error {
+	if strings.TrimSpace(contract) != connectionTestContractV1 || strings.TrimSpace(ackClaim) == "" {
+		return &ConnectionTestError{
+			Message: "The authentication provider does not advertise a supported connection-check contract.",
+			Cause:   ErrConnectionTestUnsupported,
+		}
+	}
+
 	authClient, err := client.AuthProvider(capabilityID)
 	if err != nil {
 		return &ConnectionTestError{
@@ -137,11 +145,10 @@ func runAuthProviderConnectionCheck(
 		}
 	}
 
-	probeMetadata := map[string]any{connectionTestEnabledMetadataKey: true}
-	if contract = strings.TrimSpace(contract); contract != "" {
-		probeMetadata[connectionTestContractMetadataKey] = contract
-	}
-	metadata, err := structpb.NewStruct(probeMetadata)
+	metadata, err := structpb.NewStruct(map[string]any{
+		connectionTestEnabledMetadataKey:  true,
+		connectionTestContractMetadataKey: connectionTestContractV1,
+	})
 	if err != nil {
 		return &ConnectionTestError{
 			Message: "Failed to prepare the authentication-provider connection check.",
@@ -159,11 +166,6 @@ func runAuthProviderConnectionCheck(
 			Cause:   err,
 		}
 	}
-	if strings.TrimSpace(ackClaim) == "" {
-		// Backward compatibility for pre-contract auth providers that opted in
-		// with connection_test=true before positive acknowledgement existed.
-		return nil
-	}
 	if response == nil || response.GetClaims() == nil {
 		return &ConnectionTestError{
 			Message: "The authentication provider did not acknowledge the connection check.",
@@ -178,13 +180,11 @@ func runAuthProviderConnectionCheck(
 			Cause:   ErrConnectionTestUnsupported,
 		}
 	}
-	if contract != "" {
-		responseContract, ok := claims[connectionTestResponseContractClaimKey].(string)
-		if !ok || strings.TrimSpace(responseContract) != contract {
-			return &ConnectionTestError{
-				Message: "The authentication provider acknowledged a different connection-check contract.",
-				Cause:   ErrConnectionTestUnsupported,
-			}
+	responseContract, ok := claims[connectionTestResponseContractClaimKey].(string)
+	if !ok || strings.TrimSpace(responseContract) != connectionTestContractV1 {
+		return &ConnectionTestError{
+			Message: "The authentication provider acknowledged a different connection-check contract.",
+			Cause:   ErrConnectionTestUnsupported,
 		}
 	}
 	return nil
@@ -199,9 +199,6 @@ func (s *Service) TestGlobalConfig(
 	return s.TestGlobalConfigWithClears(ctx, installationID, key, value, nil)
 }
 
-// TestGlobalConfigWithClears tests the exact prospective configuration,
-// including explicit removals of saved secrets. This keeps a successful probe
-// from describing credentials the operator has already staged for deletion.
 func (s *Service) TestGlobalConfigWithClears(
 	ctx context.Context,
 	installationID int,
@@ -232,13 +229,7 @@ func (s *Service) TestGlobalConfigWithClears(
 	if err != nil {
 		return &ConnectionTestError{Message: err.Error(), Cause: err}
 	}
-	value, err = s.preserveStoredSecrets(
-		ctx,
-		installationID,
-		key,
-		value,
-		secretPaths,
-	)
+	value, err = s.preserveStoredSecrets(ctx, installationID, key, value, secretPaths)
 	if err != nil {
 		return err
 	}
@@ -247,10 +238,7 @@ func (s *Service) TestGlobalConfigWithClears(
 	}
 	projection := globalConfigValidationProjection(manifest, key, value, submitted)
 	if err := ValidateGlobalConfigValue(manifest, key, projection); err != nil {
-		return &ConnectionTestError{
-			Message: err.Error(),
-			Cause:   err,
-		}
+		return &ConnectionTestError{Message: err.Error(), Cause: err}
 	}
 	if _, err := pluginConnectionCheckCapabilityForManifest(manifest, key); err != nil {
 		return err
@@ -345,10 +333,7 @@ func configEntriesFromValues(
 			)
 		}
 
-		entries = append(entries, &pluginv1.ConfigEntry{
-			Key:   key,
-			Value: structValue,
-		})
+		entries = append(entries, &pluginv1.ConfigEntry{Key: key, Value: structValue})
 	}
 
 	return entries, nil
@@ -393,11 +378,13 @@ func pluginConnectionCheckCapabilityForManifest(
 			Cause:   ErrConnectionTestUnsupported,
 		}
 	}
-	if len(candidates) == 1 {
+	if len(candidates) == 1 && candidates[0].kind == connectionCheckKindMetadata {
+		// Preserve the pre-extension metadata-provider behavior where a plugin
+		// exposes one unambiguous metadata connection test but predates config-key mapping.
 		return candidates[0], nil
 	}
 	return pluginConnectionCheckCapability{}, &ConnectionTestError{
-		Message: fmt.Sprintf("Connection check capability is ambiguous for config key %q.", configKey),
+		Message: fmt.Sprintf("Connection check capability is not explicitly mapped to config key %q.", configKey),
 		Cause:   ErrConnectionTestUnsupported,
 	}
 }
@@ -423,12 +410,16 @@ func pluginConnectionCheckCapabilities(manifest *pluginv1.PluginManifest) []plug
 			}
 			ackClaim, _ := metadata[connectionTestAckClaimMetadataKey].(string)
 			contract, _ := metadata[connectionTestContractMetadataKey].(string)
+			configKeys := capabilityConnectionTestConfigKeys(capability)
+			if strings.TrimSpace(contract) != connectionTestContractV1 || strings.TrimSpace(ackClaim) == "" || len(configKeys) == 0 {
+				continue
+			}
 			result = append(result, pluginConnectionCheckCapability{
 				kind:       connectionCheckKindAuth,
 				id:         capability.GetId(),
-				configKeys: capabilityConnectionTestConfigKeys(capability),
+				configKeys: configKeys,
 				ackClaim:   strings.TrimSpace(ackClaim),
-				contract:   strings.TrimSpace(contract),
+				contract:   connectionTestContractV1,
 			})
 		}
 	}
