@@ -40,9 +40,9 @@ A successful provider must explicitly acknowledge the probe in its response clai
 }
 ```
 
-When a provider advertises an acknowledgement claim or contract, a nil RPC error alone is not success. Missing, false, or mismatched acknowledgement is rejected.
+Authentication-provider connection testing is fail-closed: `connection_test=true` by itself is not sufficient. The provider must advertise the supported v1 contract, an owning configuration key, and a non-empty acknowledgement claim. A nil RPC error without the positive acknowledgement and matching response contract is not success.
 
-Legacy providers that only advertise `connection_test=true` remain supported when they are the only unambiguous connection-test capability; that compatibility path does not gain v1 guarantees.
+The older metadata-provider connection-test path remains separate for compatibility; the v1 requirements above apply to `auth_provider.v1` probes.
 
 ## Managed-role extension
 
@@ -92,6 +92,6 @@ First-time plugin account creation and the corresponding `plugin_auth_identities
 
 - Bare or unknown claims do not grant administrator access.
 - Managed-role contract mismatches fail closed.
-- A connection test targets the capability associated with the submitted configuration key when that mapping is advertised.
-- Auth connection tests with an advertised acknowledgement must positively acknowledge the exact contract version.
+- An auth-provider connection test must be explicitly mapped to the submitted configuration key.
+- Auth connection tests must advertise and positively acknowledge the exact supported contract version.
 - Existing metadata-provider connection probes remain supported, but an entirely disabled provider is not reported as a successful probe.
