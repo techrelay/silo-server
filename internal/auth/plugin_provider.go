@@ -147,7 +147,7 @@ func (p *PluginProvider) CompleteOAuth(ctx context.Context, response *pluginv1.A
 	return p.autoProvisionAndLinkUser(ctx, Credentials{}, response)
 }
 
-func (p *PluginProvider) InstallationID() int { return p.config.InstallationID }
+func (p *PluginProvider) InstallationID() int  { return p.config.InstallationID }
 func (p *PluginProvider) CapabilityID() string { return p.config.CapabilityID }
 
 func (p *PluginProvider) OAuthClient(ctx context.Context) (OAuthClient, error) {
