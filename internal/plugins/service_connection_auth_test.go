@@ -11,6 +11,7 @@ import (
 func TestPluginConnectionCheckCapabilityUsesAdvertisedAuthProvider(t *testing.T) {
 	metadata, err := structpb.NewStruct(map[string]any{
 		connectionTestEnabledMetadataKey:    true,
+		connectionTestContractMetadataKey:   "silo.auth.connection-test.v1",
 		connectionTestConfigKeysMetadataKey: []any{"ldap"},
 		connectionTestAckClaimMetadataKey:   "silo_connection_test_ok",
 	})
@@ -34,6 +35,9 @@ func TestPluginConnectionCheckCapabilityUsesAdvertisedAuthProvider(t *testing.T)
 	}
 	if capability.ackClaim != "silo_connection_test_ok" {
 		t.Fatalf("ack claim = %q", capability.ackClaim)
+	}
+	if capability.contract != "silo.auth.connection-test.v1" {
+		t.Fatalf("contract = %q", capability.contract)
 	}
 }
 
