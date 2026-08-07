@@ -21,8 +21,10 @@ import (
 )
 
 const (
-	pluginRoleClaimKey        = "silo_role"
-	pluginRoleManagedClaimKey = "silo_role_managed"
+	pluginRoleClaimKey         = "silo_role"
+	pluginRoleManagedClaimKey  = "silo_role_managed"
+	pluginRoleContractClaimKey = "silo_role_contract"
+	pluginRoleContractV1       = "silo.auth.managed-role.v1"
 )
 
 type pluginAuthClient interface {
@@ -132,11 +134,6 @@ func (p *PluginProvider) Authenticate(ctx context.Context, creds Credentials) (*
 	return p.linkProvisionedIdentity(ctx, response, user)
 }
 
-// CompleteOAuth runs the post-RPC half of plugin authentication for an
-// OAuth flow: validate the AuthenticateResponse, look up an existing
-// plugin_auth_identities row, auto-provision a new user if needed, and claim
-// the identity. The handler calls plugin ExchangeCode itself and passes the
-// response in here.
 func (p *PluginProvider) CompleteOAuth(ctx context.Context, response *pluginv1.AuthenticateResponse) (*models.User, error) {
 	if response.GetExternalSubject() == "" {
 		return nil, ErrInvalidCredentials
@@ -163,16 +160,9 @@ func (p *PluginProvider) CompleteOAuth(ctx context.Context, response *pluginv1.A
 	return p.linkProvisionedIdentity(ctx, response, user)
 }
 
-// InstallationID exposes the plugin install this provider is bound to —
-// used by the OAuth handler to match incoming /oauth/{install_id}/... requests.
 func (p *PluginProvider) InstallationID() int { return p.config.InstallationID }
-
-// CapabilityID exposes the bound capability slug (e.g. "whmcs").
 func (p *PluginProvider) CapabilityID() string { return p.config.CapabilityID }
 
-// OAuthClient returns a host-side gRPC client wrapping the plugin's
-// AuthProvider service. Used by the OAuth handler to call InitAuthorize
-// and ExchangeCode without re-resolving the installation.
 func (p *PluginProvider) OAuthClient(ctx context.Context) (OAuthClient, error) {
 	c, err := p.client(ctx)
 	if err != nil {
@@ -200,10 +190,7 @@ func (p *PluginProvider) lookupIdentity(ctx context.Context, externalSubject str
 		SELECT user_id
 		FROM plugin_auth_identities
 		WHERE plugin_installation_id = $1 AND external_subject = $2
-	`,
-		p.config.InstallationID,
-		externalSubject,
-	).Scan(&userID)
+	`, p.config.InstallationID, externalSubject).Scan(&userID)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, ErrNotFound
@@ -224,18 +211,13 @@ func (p *PluginProvider) claimIdentity(ctx context.Context, externalSubject stri
 		VALUES ($1, $2, $3)
 		ON CONFLICT (plugin_installation_id, external_subject) DO NOTHING
 		RETURNING user_id
-	`,
-		p.config.InstallationID,
-		externalSubject,
-		userID,
-	).Scan(&claimedUserID)
+	`, p.config.InstallationID, externalSubject, userID).Scan(&claimedUserID)
 	if err == nil {
 		return claimedUserID, true, nil
 	}
 	if !errors.Is(err, pgx.ErrNoRows) {
 		return 0, false, fmt.Errorf("claim plugin auth identity: %w", err)
 	}
-
 	err = p.identityPool.QueryRow(ctx, `
 		SELECT user_id
 		FROM plugin_auth_identities
@@ -247,11 +229,7 @@ func (p *PluginProvider) claimIdentity(ctx context.Context, externalSubject stri
 	return claimedUserID, false, nil
 }
 
-func (p *PluginProvider) linkProvisionedIdentity(
-	ctx context.Context,
-	response *pluginv1.AuthenticateResponse,
-	user *models.User,
-) (*models.User, error) {
+func (p *PluginProvider) linkProvisionedIdentity(ctx context.Context, response *pluginv1.AuthenticateResponse, user *models.User) (*models.User, error) {
 	claimedUserID, claimed, err := p.claimIdentity(ctx, response.GetExternalSubject(), user.ID)
 	if err != nil {
 		return nil, p.cleanupProvisionedUser(ctx, user.ID, err)
@@ -262,7 +240,6 @@ func (p *PluginProvider) linkProvisionedIdentity(
 	if claimedUserID == user.ID {
 		return user, nil
 	}
-
 	if err := p.cleanupProvisionedUser(ctx, user.ID, nil); err != nil {
 		return nil, err
 	}
@@ -288,11 +265,7 @@ func (p *PluginProvider) cleanupProvisionedUser(ctx context.Context, userID int,
 	return cause
 }
 
-func (p *PluginProvider) autoProvisionUser(
-	ctx context.Context,
-	creds Credentials,
-	response *pluginv1.AuthenticateResponse,
-) (*models.User, error) {
+func (p *PluginProvider) autoProvisionUser(ctx context.Context, creds Credentials, response *pluginv1.AuthenticateResponse) (*models.User, error) {
 	usernameBase := strings.TrimSpace(response.GetDisplayName())
 	if usernameBase == "" {
 		usernameBase = strings.TrimSpace(creds.Username)
@@ -342,8 +315,6 @@ func (p *PluginProvider) autoProvisionUser(
 		if !IsDuplicate(err) {
 			return nil, fmt.Errorf("auto-provision plugin user: %w", err)
 		}
-		// A concurrent first login may have created and linked the account
-		// between the initial identity lookup and this insert attempt.
 		if existing, lookupErr := p.lookupIdentity(ctx, response.GetExternalSubject()); lookupErr == nil && existing != nil {
 			return existing, nil
 		}
@@ -352,11 +323,7 @@ func (p *PluginProvider) autoProvisionUser(
 	return nil, fmt.Errorf("auto-provision plugin user: exhausted username attempts")
 }
 
-func (p *PluginProvider) synchronizeClaimedRole(
-	ctx context.Context,
-	user *models.User,
-	response *pluginv1.AuthenticateResponse,
-) (*models.User, error) {
+func (p *PluginProvider) synchronizeClaimedRole(ctx context.Context, user *models.User, response *pluginv1.AuthenticateResponse) (*models.User, error) {
 	desiredRole, present, err := pluginRoleFromResponse(response)
 	if err != nil {
 		return nil, err
@@ -398,7 +365,13 @@ func (p *PluginProvider) synchronizeClaimedRole(
 	}
 	if desiredRole == "user" {
 		if err := p.clearRoleSnapshot(ctx, response.GetExternalSubject()); err != nil {
-			return nil, err
+			slog.WarnContext(ctx, "clear plugin role snapshot failed",
+				"component", "auth",
+				"plugin_installation_id", p.config.InstallationID,
+				"capability_id", p.config.CapabilityID,
+				"user_id", user.ID,
+				"error", err,
+			)
 		}
 	}
 
@@ -425,9 +398,6 @@ func pluginRoleFromResponse(response *pluginv1.AuthenticateResponse) (string, bo
 	claims := response.GetClaims().AsMap()
 	managedRaw, managedExists := claims[pluginRoleManagedClaimKey]
 	if !managedExists || managedRaw == nil {
-		// A bare silo_role claim may belong to a plugin's own application
-		// contract. It has no host authorization meaning without the explicit
-		// managed-role marker.
 		return "", false, nil
 	}
 	managed, ok := managedRaw.(bool)
@@ -436,6 +406,18 @@ func pluginRoleFromResponse(response *pluginv1.AuthenticateResponse) (string, bo
 	}
 	if !managed {
 		return "", false, nil
+	}
+
+	contractRaw, exists := claims[pluginRoleContractClaimKey]
+	if !exists || contractRaw == nil {
+		return "", false, fmt.Errorf("managed plugin role requires claim %q", pluginRoleContractClaimKey)
+	}
+	contract, ok := contractRaw.(string)
+	if !ok {
+		return "", false, fmt.Errorf("plugin auth claim %q must be a string", pluginRoleContractClaimKey)
+	}
+	if strings.TrimSpace(contract) != pluginRoleContractV1 {
+		return "", false, fmt.Errorf("plugin auth claim %q contains unsupported contract %q", pluginRoleContractClaimKey, contract)
 	}
 
 	raw, exists := claims[pluginRoleClaimKey]
@@ -453,16 +435,10 @@ func pluginRoleFromResponse(response *pluginv1.AuthenticateResponse) (string, bo
 	return role, true, nil
 }
 
-func roleSyncUpdateInput(
-	user *models.User,
-	desiredRole string,
-	restorePermissions []string,
-	restoreAccessGroupID *int64,
-) (models.UpdateUserInput, bool) {
+func roleSyncUpdateInput(user *models.User, desiredRole string, restorePermissions []string, restoreAccessGroupID *int64) (models.UpdateUserInput, bool) {
 	if user == nil || user.Role == desiredRole {
 		return models.UpdateUserInput{}, false
 	}
-
 	role := desiredRole
 	input := models.UpdateUserInput{Role: &role}
 	if desiredRole == "admin" {
@@ -470,7 +446,6 @@ func roleSyncUpdateInput(
 		input.AccessGroupID = nil
 		return input, true
 	}
-
 	permissions := append([]string(nil), restorePermissions...)
 	if restorePermissions == nil {
 		permissions = DefaultUserPermissions()
@@ -485,10 +460,7 @@ func (p *PluginProvider) saveRoleSnapshot(ctx context.Context, externalSubject s
 	if p.identityPool == nil || user == nil {
 		return fmt.Errorf("plugin auth identity store unavailable for role snapshot")
 	}
-	snapshot := pluginRoleSnapshot{
-		Permissions:   append([]string(nil), user.Permissions...),
-		AccessGroupID: user.AccessGroupID,
-	}
+	snapshot := pluginRoleSnapshot{Permissions: append([]string(nil), user.Permissions...), AccessGroupID: user.AccessGroupID}
 	payload, err := json.Marshal(snapshot)
 	if err != nil {
 		return fmt.Errorf("encode plugin role snapshot: %w", err)
