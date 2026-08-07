@@ -27,39 +27,62 @@ func TestPluginProvisioningConcurrentFirstLoginDB(t *testing.T) {
 		users:        NewUserRepository(pool),
 		identityPool: pool,
 	}
-	response := &pluginv1.AuthenticateResponse{
-		ExternalSubject: "entryuuid:" + suffix,
-		DisplayName:     "Concurrent User " + suffix,
-		Email:           "concurrent-" + suffix + "@example.invalid",
+	externalSubject := "entryuuid:" + suffix
+	responses := []*pluginv1.AuthenticateResponse{
+		{
+			ExternalSubject: externalSubject,
+			DisplayName:     "Concurrent User A " + suffix,
+			Email:           "concurrent-a-" + suffix + "@example.invalid",
+		},
+		{
+			ExternalSubject: externalSubject,
+			DisplayName:     "Concurrent User B " + suffix,
+			Email:           "concurrent-b-" + suffix + "@example.invalid",
+		},
+	}
+
+	blocker, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin user-insert blocker: %v", err)
+	}
+	t.Cleanup(func() { _ = blocker.Rollback(ctx) })
+	if _, err := blocker.Exec(ctx, `LOCK TABLE users IN ACCESS EXCLUSIVE MODE`); err != nil {
+		t.Fatalf("lock users table: %v", err)
 	}
 
 	start := make(chan struct{})
-	results := make(chan *models.User, 2)
-	errs := make(chan error, 2)
+	type provisionResult struct {
+		user *models.User
+		err  error
+	}
+	results := make(chan provisionResult, 2)
 	var ready sync.WaitGroup
 	ready.Add(2)
-	for range 2 {
+	for _, response := range responses {
 		go func() {
 			ready.Done()
 			<-start
 			user, err := provider.autoProvisionAndLinkUser(ctx, Credentials{Username: response.DisplayName}, response)
-			results <- user
-			errs <- err
+			results <- provisionResult{user: user, err: err}
 		}()
 	}
 	ready.Wait()
 	close(start)
+	waitForBlockedUserInserts(t, ctx, pool, 2)
+	if err := blocker.Commit(ctx); err != nil {
+		t.Fatalf("release user-insert blocker: %v", err)
+	}
 
 	users := make([]*models.User, 0, 2)
 	for range 2 {
-		if err := <-errs; err != nil {
-			t.Fatalf("concurrent provisioning error: %v", err)
+		result := <-results
+		if result.err != nil {
+			t.Fatalf("concurrent provisioning error: %v", result.err)
 		}
-		user := <-results
-		if user == nil {
+		if result.user == nil {
 			t.Fatal("concurrent provisioning returned nil user")
 		}
-		users = append(users, user)
+		users = append(users, result.user)
 	}
 	if users[0].ID != users[1].ID {
 		t.Fatalf("concurrent callers resolved user IDs %d and %d, want one identity", users[0].ID, users[1].ID)
@@ -70,11 +93,13 @@ func TestPluginProvisioningConcurrentFirstLoginDB(t *testing.T) {
 		SELECT count(*), min(user_id)
 		FROM plugin_auth_identities
 		WHERE plugin_installation_id = $1 AND external_subject = $2`,
-		installationID, response.ExternalSubject,
+		installationID, externalSubject,
 	).Scan(&identityCount, &linkedUserID); err != nil {
 		t.Fatalf("count plugin identities: %v", err)
 	}
-	if err := pool.QueryRow(ctx, `SELECT count(*) FROM users WHERE email = $1`, NormalizeEmail(response.Email)).Scan(&provisionedUserCount); err != nil {
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM users WHERE email IN ($1, $2)`,
+		NormalizeEmail(responses[0].Email), NormalizeEmail(responses[1].Email),
+	).Scan(&provisionedUserCount); err != nil {
 		t.Fatalf("count provisioned users: %v", err)
 	}
 	if identityCount != 1 || provisionedUserCount != 1 {
@@ -91,7 +116,7 @@ func TestPluginProvisioningConcurrentFirstLoginDB(t *testing.T) {
 	}
 
 	secondResponse := &pluginv1.AuthenticateResponse{
-		ExternalSubject: response.ExternalSubject,
+		ExternalSubject: externalSubject,
 		DisplayName:     "Different User " + suffix,
 		Email:           "different-" + suffix + "@example.invalid",
 	}
@@ -101,6 +126,35 @@ func TestPluginProvisioningConcurrentFirstLoginDB(t *testing.T) {
 	}
 	if resolved.ID != linkedUserID {
 		t.Fatalf("existing identity repointed from user %d to %d", linkedUserID, resolved.ID)
+	}
+}
+
+func waitForBlockedUserInserts(t *testing.T, ctx context.Context, pool *pgxpool.Pool, want int) {
+	t.Helper()
+	waitCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		var blocked int
+		if err := pool.QueryRow(waitCtx, `
+			SELECT count(*)
+			FROM pg_locks
+			WHERE relation = 'users'::regclass
+			  AND mode = 'RowExclusiveLock'
+			  AND NOT granted
+		`).Scan(&blocked); err != nil {
+			t.Fatalf("inspect blocked user inserts: %v", err)
+		}
+		if blocked >= want {
+			return
+		}
+		select {
+		case <-waitCtx.Done():
+			t.Fatalf("waiting for %d blocked user inserts: observed %d: %v", want, blocked, waitCtx.Err())
+		case <-ticker.C:
+		}
 	}
 }
 
