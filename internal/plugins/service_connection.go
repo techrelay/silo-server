@@ -17,6 +17,12 @@ import (
 
 var ErrConnectionTestUnsupported = errors.New("plugin connection test unsupported")
 
+const (
+	connectionTestEnabledMetadataKey    = "connection_test"
+	connectionTestConfigKeysMetadataKey = "connection_test_config_keys"
+	connectionTestAckClaimMetadataKey   = "connection_test_ack_claim"
+)
+
 type ConnectionTestError struct {
 	Message string
 	Cause   error
@@ -37,8 +43,10 @@ func (e *ConnectionTestError) Unwrap() error {
 }
 
 type pluginConnectionCheckCapability struct {
-	kind string
-	id   string
+	kind       string
+	id         string
+	configKeys []string
+	ackClaim   string
 }
 
 const (
@@ -50,8 +58,9 @@ var runPluginConnectionCheck = func(
 	ctx context.Context,
 	client pluginClient,
 	manifest *pluginv1.PluginManifest,
+	configKey string,
 ) error {
-	capability, err := pluginConnectionCheckCapabilityForManifest(manifest)
+	capability, err := pluginConnectionCheckCapabilityForManifest(manifest, configKey)
 	if err != nil {
 		return err
 	}
@@ -60,7 +69,7 @@ var runPluginConnectionCheck = func(
 	case connectionCheckKindMetadata:
 		return runMetadataProviderConnectionCheck(ctx, client, manifest, capability.id)
 	case connectionCheckKindAuth:
-		return runAuthProviderConnectionCheck(ctx, client, capability.id)
+		return runAuthProviderConnectionCheck(ctx, client, capability.id, capability.ackClaim)
 	default:
 		return &ConnectionTestError{
 			Message: "Connection checks are not supported for this plugin yet.",
@@ -76,14 +85,12 @@ func runMetadataProviderConnectionCheck(
 	capabilityID string,
 ) error {
 	capability := metadataProviderConnectionCheckCapability(manifest, capabilityID)
-	if !metadataProviderSupportsConnectionProbe(capability, "movie") {
-		slog.DebugContext(ctx,
-			"skipping metadata provider connection check for unsupported probe type", "component", "plugins",
-			"plugin_id", manifest.GetPluginId(),
-			"capability_id", capabilityID,
-			"item_type", "movie",
-		)
-		return nil
+	probeType, ok := metadataProviderConnectionProbeType(capability)
+	if !ok {
+		return &ConnectionTestError{
+			Message: "The metadata provider does not advertise any enabled content type that can be probed.",
+			Cause:   ErrConnectionTestUnsupported,
+		}
 	}
 
 	metadataClient, err := client.MetadataProvider(capabilityID)
@@ -99,7 +106,7 @@ func runMetadataProviderConnectionCheck(
 
 	if _, err := metadataClient.Search(probeCtx, &pluginv1.SearchMetadataRequest{
 		Query:    "The Matrix",
-		ItemType: "movie",
+		ItemType: probeType,
 		Year:     1999,
 		Language: "en",
 	}); err != nil {
@@ -116,6 +123,7 @@ func runAuthProviderConnectionCheck(
 	ctx context.Context,
 	client pluginClient,
 	capabilityID string,
+	ackClaim string,
 ) error {
 	authClient, err := client.AuthProvider(capabilityID)
 	if err != nil {
@@ -125,7 +133,7 @@ func runAuthProviderConnectionCheck(
 		}
 	}
 
-	metadata, err := structpb.NewStruct(map[string]any{"connection_test": true})
+	metadata, err := structpb.NewStruct(map[string]any{connectionTestEnabledMetadataKey: true})
 	if err != nil {
 		return &ConnectionTestError{
 			Message: "Failed to prepare the authentication-provider connection check.",
@@ -136,12 +144,29 @@ func runAuthProviderConnectionCheck(
 	probeCtx, cancel := context.WithTimeout(ctx, 20*time.Second)
 	defer cancel()
 
-	if _, err := authClient.Authenticate(probeCtx, &pluginv1.AuthenticateRequest{
-		Metadata: metadata,
-	}); err != nil {
+	response, err := authClient.Authenticate(probeCtx, &pluginv1.AuthenticateRequest{Metadata: metadata})
+	if err != nil {
 		return &ConnectionTestError{
 			Message: fmt.Sprintf("Connection check failed: %v", err),
 			Cause:   err,
+		}
+	}
+	if strings.TrimSpace(ackClaim) == "" {
+		// Backward compatibility for pre-contract auth providers that opted in
+		// with connection_test=true before positive acknowledgement existed.
+		return nil
+	}
+	if response == nil || response.GetClaims() == nil {
+		return &ConnectionTestError{
+			Message: "The authentication provider did not acknowledge the connection check.",
+			Cause:   ErrConnectionTestUnsupported,
+		}
+	}
+	ack, ok := response.GetClaims().AsMap()[ackClaim].(bool)
+	if !ok || !ack {
+		return &ConnectionTestError{
+			Message: "The authentication provider did not acknowledge the connection check.",
+			Cause:   ErrConnectionTestUnsupported,
 		}
 	}
 	return nil
@@ -166,7 +191,8 @@ func (s *Service) TestGlobalConfigWithClears(
 	value map[string]any,
 	clearSecrets []string,
 ) error {
-	if strings.TrimSpace(key) == "" {
+	key = strings.TrimSpace(key)
+	if key == "" {
 		return &ConnectionTestError{Message: "Config key is required"}
 	}
 	if s.host == nil {
@@ -208,7 +234,7 @@ func (s *Service) TestGlobalConfigWithClears(
 			Cause:   err,
 		}
 	}
-	if _, err := pluginConnectionCheckCapabilityForManifest(manifest); err != nil {
+	if _, err := pluginConnectionCheckCapabilityForManifest(manifest, key); err != nil {
 		return err
 	}
 
@@ -242,7 +268,7 @@ func (s *Service) TestGlobalConfigWithClears(
 		}
 	}()
 
-	return runPluginConnectionCheck(ctx, client, manifest)
+	return runPluginConnectionCheck(ctx, client, manifest, key)
 }
 
 func (s *Service) mergedGlobalConfigEntries(
@@ -323,51 +349,110 @@ func cloneConfigMap(value map[string]any) map[string]any {
 
 func pluginConnectionCheckCapabilityForManifest(
 	manifest *pluginv1.PluginManifest,
+	configKey string,
 ) (pluginConnectionCheckCapability, error) {
-	if capabilityID, err := metadataProviderConnectionCheckCapabilityID(manifest); err == nil {
-		return pluginConnectionCheckCapability{
-			kind: connectionCheckKindMetadata,
-			id:   capabilityID,
-		}, nil
+	candidates := pluginConnectionCheckCapabilities(manifest)
+	if len(candidates) == 0 {
+		return pluginConnectionCheckCapability{}, &ConnectionTestError{
+			Message: "Connection checks are not supported for this plugin yet.",
+			Cause:   ErrConnectionTestUnsupported,
+		}
 	}
-	if capabilityID, ok := authProviderConnectionCheckCapabilityID(manifest); ok {
-		return pluginConnectionCheckCapability{
-			kind: connectionCheckKindAuth,
-			id:   capabilityID,
-		}, nil
+
+	configKey = strings.TrimSpace(configKey)
+	matches := make([]pluginConnectionCheckCapability, 0, len(candidates))
+	for _, candidate := range candidates {
+		if candidate.matchesConfigKey(configKey) {
+			matches = append(matches, candidate)
+		}
+	}
+	if len(matches) == 1 {
+		return matches[0], nil
+	}
+	if len(matches) > 1 {
+		return pluginConnectionCheckCapability{}, &ConnectionTestError{
+			Message: fmt.Sprintf("Multiple plugin capabilities advertise a connection check for config key %q.", configKey),
+			Cause:   ErrConnectionTestUnsupported,
+		}
+	}
+	if len(candidates) == 1 {
+		return candidates[0], nil
 	}
 	return pluginConnectionCheckCapability{}, &ConnectionTestError{
-		Message: "Connection checks are not supported for this plugin yet.",
+		Message: fmt.Sprintf("Connection check capability is ambiguous for config key %q.", configKey),
 		Cause:   ErrConnectionTestUnsupported,
 	}
 }
 
-func authProviderConnectionCheckCapabilityID(
-	manifest *pluginv1.PluginManifest,
-) (string, bool) {
+func pluginConnectionCheckCapabilities(manifest *pluginv1.PluginManifest) []pluginConnectionCheckCapability {
+	result := make([]pluginConnectionCheckCapability, 0)
 	for _, capability := range manifest.GetCapabilities() {
-		if capability.GetType() != "auth_provider.v1" || capability.GetMetadata() == nil {
-			continue
-		}
-		enabled, ok := capability.GetMetadata().AsMap()["connection_test"].(bool)
-		if ok && enabled {
-			return capability.GetId(), true
+		switch capability.GetType() {
+		case "metadata_provider.v1":
+			result = append(result, pluginConnectionCheckCapability{
+				kind:       connectionCheckKindMetadata,
+				id:         capability.GetId(),
+				configKeys: capabilityConnectionTestConfigKeys(capability),
+			})
+		case "auth_provider.v1":
+			if capability.GetMetadata() == nil {
+				continue
+			}
+			metadata := capability.GetMetadata().AsMap()
+			enabled, ok := metadata[connectionTestEnabledMetadataKey].(bool)
+			if !ok || !enabled {
+				continue
+			}
+			ackClaim, _ := metadata[connectionTestAckClaimMetadataKey].(string)
+			result = append(result, pluginConnectionCheckCapability{
+				kind:       connectionCheckKindAuth,
+				id:         capability.GetId(),
+				configKeys: capabilityConnectionTestConfigKeys(capability),
+				ackClaim:   strings.TrimSpace(ackClaim),
+			})
 		}
 	}
-	return "", false
+	return result
 }
 
-func metadataProviderConnectionCheckCapabilityID(manifest *pluginv1.PluginManifest) (string, error) {
-	for _, capability := range manifest.GetCapabilities() {
-		if capability.GetType() != "metadata_provider.v1" {
+func (c pluginConnectionCheckCapability) matchesConfigKey(key string) bool {
+	if key == "" || len(c.configKeys) == 0 {
+		return false
+	}
+	for _, configuredKey := range c.configKeys {
+		if configuredKey == key {
+			return true
+		}
+	}
+	return false
+}
+
+func capabilityConnectionTestConfigKeys(capability *pluginv1.CapabilityDescriptor) []string {
+	if capability == nil || capability.GetMetadata() == nil {
+		return nil
+	}
+	raw, ok := capability.GetMetadata().AsMap()[connectionTestConfigKeysMetadataKey].([]any)
+	if !ok {
+		return nil
+	}
+	keys := make([]string, 0, len(raw))
+	seen := make(map[string]struct{}, len(raw))
+	for _, entry := range raw {
+		key, ok := entry.(string)
+		if !ok {
 			continue
 		}
-		return capability.GetId(), nil
+		key = strings.TrimSpace(key)
+		if key == "" {
+			continue
+		}
+		if _, exists := seen[key]; exists {
+			continue
+		}
+		seen[key] = struct{}{}
+		keys = append(keys, key)
 	}
-	return "", &ConnectionTestError{
-		Message: "Connection checks are not supported for this plugin yet.",
-		Cause:   ErrConnectionTestUnsupported,
-	}
+	return keys
 }
 
 func metadataProviderConnectionCheckCapability(
@@ -382,15 +467,29 @@ func metadataProviderConnectionCheckCapability(
 	return nil
 }
 
-func metadataProviderSupportsConnectionProbe(
-	capability *pluginv1.CapabilityDescriptor,
-	contentType string,
-) bool {
+func metadataProviderConnectionProbeType(capability *pluginv1.CapabilityDescriptor) (string, bool) {
 	priorities, ok := metadataProviderDefaultPriorities(capability)
 	if !ok {
-		return true
+		return "movie", true
 	}
-	return priorities[contentType] > 0
+	keys := make([]string, 0, len(priorities))
+	for key, priority := range priorities {
+		if priority > 0 {
+			keys = append(keys, key)
+		}
+	}
+	if len(keys) == 0 {
+		return "", false
+	}
+	sort.Strings(keys)
+	for _, preferred := range []string{"movie", "series", "show", "book"} {
+		for _, key := range keys {
+			if key == preferred {
+				return key, true
+			}
+		}
+	}
+	return keys[0], true
 }
 
 func metadataProviderDefaultPriorities(
