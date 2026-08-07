@@ -11,7 +11,7 @@ import (
 func TestPluginConnectionCheckCapabilityUsesAdvertisedAuthProvider(t *testing.T) {
 	metadata, err := structpb.NewStruct(map[string]any{
 		connectionTestEnabledMetadataKey:    true,
-		connectionTestConfigKeysMetadataKey: []string{"ldap"},
+		connectionTestConfigKeysMetadataKey: []any{"ldap"},
 		connectionTestAckClaimMetadataKey:   "silo_connection_test_ok",
 	})
 	if err != nil {
@@ -73,13 +73,13 @@ func TestPluginConnectionCheckCapabilityRejectsDisabledAuthProbe(t *testing.T) {
 func TestPluginConnectionCheckCapabilityTargetsConfigKey(t *testing.T) {
 	authMetadata, err := structpb.NewStruct(map[string]any{
 		connectionTestEnabledMetadataKey:    true,
-		connectionTestConfigKeysMetadataKey: []string{"ldap"},
+		connectionTestConfigKeysMetadataKey: []any{"ldap"},
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
 	metadataMetadata, err := structpb.NewStruct(map[string]any{
-		connectionTestConfigKeysMetadataKey: []string{"metadata"},
+		connectionTestConfigKeysMetadataKey: []any{"metadata"},
 	})
 	if err != nil {
 		t.Fatal(err)
