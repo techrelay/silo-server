@@ -14,9 +14,7 @@ An auth provider opts in through its `auth_provider.v1` capability metadata:
 {
   "connection_test": true,
   "connection_test_contract": "silo.auth.connection-test.v1",
-  "connection_test_config_keys": ["ldap"],
-  "connection_test_ack_claim": "silo_connection_test_ok",
-  "connection_test_response_contract_claim": "silo_connection_test_contract"
+  "connection_test_config_keys": ["ldap"]
 }
 ```
 
@@ -31,7 +29,8 @@ For the v1 extension the host calls `Authenticate` with no user credentials and 
 }
 ```
 
-A successful provider must explicitly acknowledge the probe in its response claims:
+The v1 response claim names are fixed. A successful provider must explicitly acknowledge the probe
+in its response claims:
 
 ```json
 {
@@ -40,7 +39,7 @@ A successful provider must explicitly acknowledge the probe in its response clai
 }
 ```
 
-Authentication-provider connection testing is fail-closed: `connection_test=true` by itself is not sufficient. The provider must advertise the supported v1 contract, an owning configuration key, and a non-empty acknowledgement claim. A nil RPC error without the positive acknowledgement and matching response contract is not success.
+Authentication-provider connection testing is fail-closed: `connection_test=true` by itself is not sufficient. The provider must advertise the supported v1 contract and an owning configuration key. A nil RPC error without the fixed positive acknowledgement and matching response contract is not success.
 
 The older metadata-provider connection-test path remains separate for compatibility; the v1 requirements above apply to `auth_provider.v1` probes.
 
@@ -53,14 +52,12 @@ A provider advertises its role contract in capability metadata:
 ```json
 {
   "managed_role_contract": "silo.auth.managed-role.v1",
-  "role_contract_claim": "silo_role_contract",
-  "role_managed_claim": "silo_role_managed",
-  "role_claim": "silo_role",
   "role_values": ["user", "admin"]
 }
 ```
 
-A response requests host role management only when all three values are present and valid:
+The v1 response claim names are fixed. A response requests host role management only when all three
+values are present and valid:
 
 ```json
 {
@@ -70,7 +67,7 @@ A response requests host role management only when all three values are present 
 }
 ```
 
-The host ignores a bare `silo_role` claim and ignores `silo_role_managed=false`. If management is requested, the contract must be exactly v1 and the role must be `user` or `admin`; malformed managed-role claims fail authentication rather than silently escalating or guessing.
+The host captures this capability opt-in when it constructs the provider. Without the exact advertised v1 contract, all role claims are ignored and authentication continues normally. For opted-in providers, the host ignores a bare `silo_role` claim and ignores `silo_role_managed=false`. If management is requested, the response contract must be exactly v1 and the role must be `user` or `admin`; malformed managed-role claims fail authentication rather than silently escalating or guessing.
 
 Authentication plugins are trusted code, but changing a Silo user's administrator role is still an explicit authorization action. The version token and managed marker prevent unrelated application claims from accidentally acquiring host authorization semantics.
 
@@ -91,6 +88,7 @@ First-time plugin account creation and the corresponding `plugin_auth_identities
 ## Security invariants
 
 - Bare or unknown claims do not grant administrator access.
+- Providers cannot manage roles without advertising the exact supported capability contract.
 - Managed-role contract mismatches fail closed.
 - An auth-provider connection test must be explicitly mapped to the submitted configuration key.
 - Auth connection tests must advertise and positively acknowledge the exact supported contract version.
