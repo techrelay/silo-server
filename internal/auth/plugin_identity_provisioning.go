@@ -167,7 +167,7 @@ func createPluginUserTx(ctx context.Context, tx pgx.Tx, input pluginUserCreateIn
 		input.PasswordHash,
 		input.Role,
 		input.Permissions,
-		[]int64(nil),
+		[]int(nil),
 		"",
 	))
 	if err != nil {
