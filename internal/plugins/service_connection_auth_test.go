@@ -13,7 +13,6 @@ func TestPluginConnectionCheckCapabilityUsesAdvertisedAuthProvider(t *testing.T)
 		connectionTestEnabledMetadataKey:    true,
 		connectionTestContractMetadataKey:   "silo.auth.connection-test.v1",
 		connectionTestConfigKeysMetadataKey: []any{"ldap"},
-		connectionTestAckClaimMetadataKey:   "silo_connection_test_ok",
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -33,11 +32,64 @@ func TestPluginConnectionCheckCapabilityUsesAdvertisedAuthProvider(t *testing.T)
 	if capability.kind != connectionCheckKindAuth || capability.id != "ldap" {
 		t.Fatalf("capability = %#v, want auth provider ldap", capability)
 	}
-	if capability.ackClaim != "silo_connection_test_ok" {
-		t.Fatalf("ack claim = %q", capability.ackClaim)
-	}
 	if capability.contract != "silo.auth.connection-test.v1" {
 		t.Fatalf("contract = %q", capability.contract)
+	}
+}
+
+func TestPluginConnectionCheckCapabilityPreservesUnsupportedContract(t *testing.T) {
+	metadata, err := structpb.NewStruct(map[string]any{
+		connectionTestEnabledMetadataKey:    true,
+		connectionTestContractMetadataKey:   " " + connectionTestContractV1,
+		connectionTestConfigKeysMetadataKey: []any{"ldap"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifest := &pluginv1.PluginManifest{Capabilities: []*pluginv1.CapabilityDescriptor{{
+		Type: "auth_provider.v1", Id: "ldap", Metadata: metadata,
+	}}}
+	capability, err := pluginConnectionCheckCapabilityForManifest(manifest, "ldap")
+	if err != nil {
+		t.Fatalf("select auth capability: %v", err)
+	}
+	if capability.contract == connectionTestContractV1 {
+		t.Fatalf("malformed contract normalized to supported v1: %q", capability.contract)
+	}
+}
+
+func TestAuthProviderConnectionTestRequiresFixedV1ResponseClaims(t *testing.T) {
+	claims, err := structpb.NewStruct(map[string]any{
+		connectionTestAckClaimKey:              true,
+		connectionTestResponseContractClaimKey: connectionTestContractV1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := validateAuthProviderConnectionTestResponse(&pluginv1.AuthenticateResponse{Claims: claims}); err != nil {
+		t.Fatalf("valid fixed response claims rejected: %v", err)
+	}
+
+	claims, err = structpb.NewStruct(map[string]any{
+		"custom_ack":                           true,
+		connectionTestResponseContractClaimKey: connectionTestContractV1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := validateAuthProviderConnectionTestResponse(&pluginv1.AuthenticateResponse{Claims: claims}); !errors.Is(err, ErrConnectionTestUnsupported) {
+		t.Fatalf("custom acknowledgement error = %v, want ErrConnectionTestUnsupported", err)
+	}
+
+	claims, err = structpb.NewStruct(map[string]any{
+		connectionTestAckClaimKey:              true,
+		connectionTestResponseContractClaimKey: "silo.auth.connection-test.v2",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := validateAuthProviderConnectionTestResponse(&pluginv1.AuthenticateResponse{Claims: claims}); !errors.Is(err, ErrConnectionTestUnsupported) {
+		t.Fatalf("unsupported response contract error = %v, want ErrConnectionTestUnsupported", err)
 	}
 }
 

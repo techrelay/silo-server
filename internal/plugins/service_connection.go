@@ -21,7 +21,7 @@ const (
 	connectionTestEnabledMetadataKey       = "connection_test"
 	connectionTestContractMetadataKey      = "connection_test_contract"
 	connectionTestConfigKeysMetadataKey    = "connection_test_config_keys"
-	connectionTestAckClaimMetadataKey      = "connection_test_ack_claim"
+	connectionTestAckClaimKey              = "silo_connection_test_ok"
 	connectionTestResponseContractClaimKey = "silo_connection_test_contract"
 	connectionTestContractV1               = "silo.auth.connection-test.v1"
 )
@@ -49,7 +49,6 @@ type pluginConnectionCheckCapability struct {
 	kind       string
 	id         string
 	configKeys []string
-	ackClaim   string
 	contract   string
 }
 
@@ -73,7 +72,7 @@ var runPluginConnectionCheck = func(
 	case connectionCheckKindMetadata:
 		return runMetadataProviderConnectionCheck(ctx, client, manifest, capability.id)
 	case connectionCheckKindAuth:
-		return runAuthProviderConnectionCheck(ctx, client, capability.id, capability.ackClaim, capability.contract)
+		return runAuthProviderConnectionCheck(ctx, client, capability.id, capability.contract)
 	default:
 		return &ConnectionTestError{
 			Message: "Connection checks are not supported for this plugin yet.",
@@ -130,10 +129,9 @@ func runAuthProviderConnectionCheck(
 	ctx context.Context,
 	client pluginClient,
 	capabilityID string,
-	ackClaim string,
 	contract string,
 ) error {
-	if strings.TrimSpace(contract) != connectionTestContractV1 || strings.TrimSpace(ackClaim) == "" {
+	if contract != connectionTestContractV1 {
 		return &ConnectionTestError{
 			Message: "The authentication provider does not advertise a supported connection-check contract.",
 			Cause:   ErrConnectionTestUnsupported,
@@ -169,6 +167,10 @@ func runAuthProviderConnectionCheck(
 			Cause:   err,
 		}
 	}
+	return validateAuthProviderConnectionTestResponse(response)
+}
+
+func validateAuthProviderConnectionTestResponse(response *pluginv1.AuthenticateResponse) error {
 	if response == nil || response.GetClaims() == nil {
 		return &ConnectionTestError{
 			Message: "The authentication provider did not acknowledge the connection check.",
@@ -176,7 +178,7 @@ func runAuthProviderConnectionCheck(
 		}
 	}
 	claims := response.GetClaims().AsMap()
-	ack, ok := claims[ackClaim].(bool)
+	ack, ok := claims[connectionTestAckClaimKey].(bool)
 	if !ok || !ack {
 		return &ConnectionTestError{
 			Message: "The authentication provider did not acknowledge the connection check.",
@@ -184,7 +186,7 @@ func runAuthProviderConnectionCheck(
 		}
 	}
 	responseContract, ok := claims[connectionTestResponseContractClaimKey].(string)
-	if !ok || strings.TrimSpace(responseContract) != connectionTestContractV1 {
+	if !ok || responseContract != connectionTestContractV1 {
 		return &ConnectionTestError{
 			Message: "The authentication provider acknowledged a different connection-check contract.",
 			Cause:   ErrConnectionTestUnsupported,
@@ -409,14 +411,12 @@ func pluginConnectionCheckCapabilities(manifest *pluginv1.PluginManifest) []plug
 			if !ok || !enabled {
 				continue
 			}
-			ackClaim, _ := metadata[connectionTestAckClaimMetadataKey].(string)
 			contract, _ := metadata[connectionTestContractMetadataKey].(string)
 			result = append(result, pluginConnectionCheckCapability{
 				kind:       connectionCheckKindAuth,
 				id:         capability.GetId(),
 				configKeys: capabilityConnectionTestConfigKeys(capability),
-				ackClaim:   strings.TrimSpace(ackClaim),
-				contract:   strings.TrimSpace(contract),
+				contract:   contract,
 			})
 		}
 	}
